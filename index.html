@@ -207,12 +207,14 @@ select:focus, input:focus{outline:2px solid var(--accent); outline-offset:1px;}
       <p>Many many Digimon, battlin'</p>
     </div>
     <div class="header-right">
+      <span class="admin-badge" id="testModeBadge" style="display:none; color:var(--loss); border-color:var(--loss); background:rgba(228,87,74,0.12);">Test mode — not live data</span>
       <span class="admin-badge" id="adminBadge" style="display:none;">Admin mode</span>
       <div class="header-stat">Matches logged<b id="matchCount">0</b></div>
     </div>
   </div>
 
   <div class="admin-bar">
+    <button class="link-btn" id="seedDummyBtn" style="display:none;">Seed dummy data</button>
     <button class="link-btn" id="adminToggleBtn" style="display:none;">Admin login</button>
     <button class="link-btn" id="syncBtn" style="display:none;">↻ Sync</button>
   </div>
@@ -236,8 +238,11 @@ select:focus, input:focus{outline:2px solid var(--accent); outline-offset:1px;}
 
   <div class="two-col">
     <div class="panel">
-      <h2>Log a match</h2>
-      <div id="addPlayerBlock">
+      <div class="footer-row" style="margin-bottom:0;">
+        <h2 style="margin-bottom:0;">Log a match</h2>
+        <button class="btn-ghost btn-small" id="repeatLastBtn">↻ Repeat last matchup</button>
+      </div>
+      <div id="addPlayerBlock" style="margin-top:16px;">
         <label>Add a player</label>
         <div class="add-player-row">
           <input type="text" id="newPlayerName" placeholder="Player name" maxlength="30">
@@ -252,7 +257,8 @@ select:focus, input:focus{outline:2px solid var(--accent); outline-offset:1px;}
         </div>
         <div class="field">
           <label>Player 1 archetype</label>
-          <input type="text" id="p1Arch" list="archetypeList" placeholder="e.g. Beelzemon" maxlength="40">
+          <select id="p1Arch"></select>
+          <input type="text" id="p1ArchNew" placeholder="New archetype name" maxlength="40" style="display:none; margin-top:8px;">
         </div>
         <div class="field">
           <label>Player 2</label>
@@ -260,10 +266,10 @@ select:focus, input:focus{outline:2px solid var(--accent); outline-offset:1px;}
         </div>
         <div class="field">
           <label>Player 2 archetype</label>
-          <input type="text" id="p2Arch" list="archetypeList" placeholder="e.g. Medusamon" maxlength="40">
+          <select id="p2Arch"></select>
+          <input type="text" id="p2ArchNew" placeholder="New archetype name" maxlength="40" style="display:none; margin-top:8px;">
         </div>
       </div>
-      <datalist id="archetypeList"></datalist>
       <div class="field">
         <label>Result</label>
         <div class="winner-picker" id="winnerPicker">
@@ -316,7 +322,10 @@ const firebaseConfig = {
 };
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp);
-const stateDocRef = doc(db, 'digiMmd', 'state');
+// Running locally (for testing) writes to a separate sandbox document instead of
+// the live one your friends use, so test matches/players can never leak into their view.
+const isLocalTest = ['localhost','127.0.0.1'].includes(window.location.hostname);
+const stateDocRef = doc(db, 'digiMmd', isLocalTest ? 'test' : 'state');
 
 const ADMIN_SESSION_KEY = 'digi-mmd-admin-session';
 const START_ELO = 1000;
@@ -547,9 +556,40 @@ function renderMatchupList(map){
 }
 
 /* ---------- rendering ---------- */
-function populateArchetypeDatalist(){
-  document.getElementById('archetypeList').innerHTML =
-    state.archetypes.map(a=>`<option value="${escapeHtml(a.name)}">`).join('');
+function populateArchetypeSelects(){
+  const sorted = [...state.archetypes].sort((a,b)=>a.name.localeCompare(b.name));
+  const optionsHtml = sorted.map(a=>`<option value="${a.id}">${escapeHtml(a.name)}</option>`).join('');
+  ['p1Arch','p2Arch'].forEach(id=>{
+    const sel = document.getElementById(id);
+    const prev = sel.value;
+    sel.innerHTML = optionsHtml + `<option value="__new__">+ New archetype…</option>`;
+    if(sorted.some(a=>a.id===prev) || prev==='__new__'){ sel.value = prev; }
+    else if(sorted.length){ sel.value = sorted[0].id; }
+    toggleArchNewInput(id);
+  });
+}
+
+function toggleArchNewInput(selectId){
+  const sel = document.getElementById(selectId);
+  const newInput = document.getElementById(selectId+'New');
+  newInput.style.display = sel.value === '__new__' ? 'block' : 'none';
+}
+
+function setArchSelectValue(prefix, archId){
+  const sel = document.getElementById(prefix+'Arch');
+  const exists = Array.from(sel.options).some(o=>o.value===archId);
+  sel.value = exists ? archId : '__new__';
+  toggleArchNewInput(prefix+'Arch');
+}
+
+// Prevents the same player being chosen as both Player 1 and Player 2:
+// disables the other side's currently-picked player as an option, and
+// auto-shifts a select off a collision if one occurs (e.g. after repeating a matchup).
+function syncPlayerSelectExclusions(){
+  const p1 = document.getElementById('p1Select');
+  const p2 = document.getElementById('p2Select');
+  Array.from(p1.options).forEach(o=> o.disabled = (o.value !== '' && o.value === p2.value));
+  Array.from(p2.options).forEach(o=> o.disabled = (o.value !== '' && o.value === p1.value));
 }
 
 function populatePlayerSelects(){
@@ -560,6 +600,12 @@ function populatePlayerSelects(){
   p1.innerHTML = opts; p2.innerHTML = opts;
   if(state.players.some(p=>p.id===prevP1)) p1.value = prevP1;
   if(state.players.some(p=>p.id===prevP2)) p2.value = prevP2;
+  // avoid both defaulting to the same player (e.g. on first-ever load)
+  if(p1.value && p1.value === p2.value){
+    const alt = state.players.find(pl=>pl.id !== p1.value);
+    if(alt) p2.value = alt.id;
+  }
+  syncPlayerSelectExclusions();
 }
 
 function renderLeaderboard(){
@@ -739,7 +785,7 @@ function renderAdminUI(){
 
 function renderAll(){
   populatePlayerSelects();
-  populateArchetypeDatalist();
+  populateArchetypeSelects();
   renderLeaderboard();
   renderHistory();
   renderAdminUI();
@@ -767,21 +813,30 @@ function setWinnerSelection(val){
   document.querySelectorAll('.winner-btn').forEach(b=> b.classList.toggle('selected', b.dataset.val===val));
 }
 
+function resolveArchFromForm(prefix){
+  const sel = document.getElementById(prefix+'Arch').value;
+  if(sel === '__new__'){
+    const name = document.getElementById(prefix+'ArchNew').value.trim();
+    if(!name) return null;
+    return findOrCreateArchetype(name);
+  }
+  return sel || null;
+}
+
 async function submitMatch(){
   const p1Id = document.getElementById('p1Select').value;
   const p2Id = document.getElementById('p2Select').value;
-  const p1ArchName = document.getElementById('p1Arch').value;
-  const p2ArchName = document.getElementById('p2Arch').value;
 
   if(!p1Id || !p2Id){ showFormError('Add at least two players first.'); return; }
   if(p1Id === p2Id){ showFormError('Player 1 and Player 2 must be different.'); return; }
-  if(!p1ArchName.trim() || !p2ArchName.trim()){ showFormError('Enter an archetype for both players.'); return; }
+
+  const p1ArchId = resolveArchFromForm('p1');
+  const p2ArchId = resolveArchFromForm('p2');
+  if(!p1ArchId || !p2ArchId){ showFormError('Choose or enter an archetype for both players.'); return; }
   if(!selectedResult){ showFormError('Pick a result.'); return; }
 
   const p1 = state.players.find(p=>p.id===p1Id);
   const p2 = state.players.find(p=>p.id===p2Id);
-  const p1ArchId = findOrCreateArchetype(p1ArchName);
-  const p2ArchId = findOrCreateArchetype(p2ArchName);
 
   const p1EloBefore = p1.elo, p2EloBefore = p2.elo;
   const exp1 = expectedScore(p1EloBefore, p2EloBefore);
@@ -802,10 +857,32 @@ async function submitMatch(){
 
   setWinnerSelection(null);
   document.querySelectorAll('.winner-btn').forEach(b=>b.classList.remove('selected'));
-  document.getElementById('p1Arch').value=''; document.getElementById('p2Arch').value='';
+  document.getElementById('p1ArchNew').value=''; document.getElementById('p2ArchNew').value='';
   renderAll();
   await saveData();
 }
+
+// Pre-fills the form from the most recent match without saving anything —
+// lets players confirm/adjust before hitting Record match themselves.
+function repeatLastMatchup(){
+  if(state.matches.length===0){ showFormError('No previous match to repeat yet.'); return; }
+  const last = state.matches[state.matches.length-1];
+
+  const p1Select = document.getElementById('p1Select');
+  const p2Select = document.getElementById('p2Select');
+  if(state.players.some(p=>p.id===last.p1Id)) p1Select.value = last.p1Id;
+  if(state.players.some(p=>p.id===last.p2Id)) p2Select.value = last.p2Id;
+  syncPlayerSelectExclusions();
+
+  setArchSelectValue('p1', last.p1ArchId);
+  setArchSelectValue('p2', last.p2ArchId);
+  document.getElementById('p1ArchNew').value='';
+  document.getElementById('p2ArchNew').value='';
+
+  setWinnerSelection(null);
+  document.querySelectorAll('.winner-btn').forEach(b=>b.classList.remove('selected'));
+}
+
 
 async function undoLast(){
   if(state.matches.length===0) return;
@@ -829,14 +906,88 @@ async function resetAll(){
   await saveData();
 }
 
+// Test-mode only: fills the sandbox document with fake players, archetypes, and a
+// realistic-looking match history (using the same ELO math as real matches) so
+// there's data to click around with right away, instead of typing it all by hand.
+async function seedDummyData(){
+  const ok = await customConfirm('Replace current TEST data with fresh dummy players and matches?\n\nThis only touches the local test sandbox — it can never affect the live tracker your friends use.');
+  if(!ok) return;
+
+  const keepPasscode = state.meta.adminPasscode;
+  const names = ['Tai','Matt','Sora','Izzy','Mimi'];
+  const archNames = ['BlackWarGreymon','MetalGarurumon','Angewomon','HerculesKabuterimon','Rosemon','Beelzemon'];
+
+  state = {
+    meta: { adminPasscode: keepPasscode },
+    players: names.map(n=>({ id: uid(), name: n, elo: START_ELO, wins:0, losses:0, draws:0, avatarUrl:null })),
+    archetypes: archNames.map(n=>({ id: uid(), name: n, artUrl: null })),
+    matches: []
+  };
+
+  const numMatches = 14;
+  for(let i=0;i<numMatches;i++){
+    const p1 = state.players[Math.floor(Math.random()*state.players.length)];
+    let p2;
+    do { p2 = state.players[Math.floor(Math.random()*state.players.length)]; } while(p2.id === p1.id);
+    const arch1 = state.archetypes[Math.floor(Math.random()*state.archetypes.length)];
+    const arch2 = state.archetypes[Math.floor(Math.random()*state.archetypes.length)];
+
+    const roll = Math.random();
+    const result = roll < 0.1 ? 'draw' : (roll < 0.55 ? 'p1' : 'p2');
+
+    const p1EloBefore = p1.elo, p2EloBefore = p2.elo;
+    const exp1 = expectedScore(p1EloBefore, p2EloBefore);
+    const exp2 = 1 - exp1;
+    let score1, score2;
+    if(result === 'p1'){ score1=1; score2=0; p1.wins++; p2.losses++; }
+    else if(result === 'p2'){ score1=0; score2=1; p2.wins++; p1.losses++; }
+    else { score1=0.5; score2=0.5; p1.draws++; p2.draws++; }
+    p1.elo = p1EloBefore + K*(score1-exp1);
+    p2.elo = p2EloBefore + K*(score2-exp2);
+
+    state.matches.push({
+      id: uid(), timestamp: Date.now() - (numMatches-i)*3600000,
+      p1Id: p1.id, p2Id: p2.id, p1ArchId: arch1.id, p2ArchId: arch2.id, result,
+      p1EloBefore, p1EloAfter: p1.elo, p2EloBefore, p2EloAfter: p2.elo
+    });
+  }
+
+  renderAll();
+  await saveData();
+}
+
 function init(){
   isAdmin = getAdminSession();
+  document.getElementById('testModeBadge').style.display = isLocalTest ? 'inline-block' : 'none';
+  document.getElementById('seedDummyBtn').style.display = isLocalTest ? 'inline-block' : 'none';
+  document.getElementById('seedDummyBtn').addEventListener('click', seedDummyData);
   document.getElementById('addPlayerBtn').addEventListener('click', addPlayer);
   document.getElementById('newPlayerName').addEventListener('keydown', e=>{ if(e.key==='Enter') addPlayer(); });
   document.getElementById('submitMatch').addEventListener('click', submitMatch);
   document.getElementById('adminToggleBtn').addEventListener('click', toggleAdmin);
   document.getElementById('syncBtn').addEventListener('click', startListening);
   document.getElementById('retryLoadBtn').addEventListener('click', startListening);
+  document.getElementById('repeatLastBtn').addEventListener('click', repeatLastMatchup);
+
+  const p1Select = document.getElementById('p1Select');
+  const p2Select = document.getElementById('p2Select');
+  p1Select.addEventListener('change', ()=>{
+    if(p1Select.value === p2Select.value){
+      const alt = state.players.find(pl=>pl.id !== p1Select.value);
+      if(alt) p2Select.value = alt.id;
+    }
+    syncPlayerSelectExclusions();
+  });
+  p2Select.addEventListener('change', ()=>{
+    if(p2Select.value === p1Select.value){
+      const alt = state.players.find(pl=>pl.id !== p2Select.value);
+      if(alt) p1Select.value = alt.id;
+    }
+    syncPlayerSelectExclusions();
+  });
+  document.getElementById('p1Arch').addEventListener('change', ()=> toggleArchNewInput('p1Arch'));
+  document.getElementById('p2Arch').addEventListener('change', ()=> toggleArchNewInput('p2Arch'));
+
   document.querySelectorAll('.winner-btn').forEach(b=> b.addEventListener('click', ()=> setWinnerSelection(b.dataset.val)));
   startListening();
 }
