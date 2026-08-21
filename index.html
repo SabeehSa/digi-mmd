@@ -159,6 +159,16 @@ select:focus, input:focus{outline:2px solid var(--accent); outline-offset:1px;}
 .error-msg{color:var(--loss); font-size:12px; margin-top:8px; font-family:var(--mono);}
 
 /* History */
+.history-scroll{
+  max-height:560px; overflow-y:auto; padding-right:4px;
+  scrollbar-width:thin; scrollbar-color:var(--border) transparent;
+  -webkit-overflow-scrolling:touch;
+}
+.history-scroll::-webkit-scrollbar{width:7px;}
+.history-scroll::-webkit-scrollbar-track{background:transparent;}
+.history-scroll::-webkit-scrollbar-thumb{background:var(--border); border-radius:4px;}
+.history-scroll::-webkit-scrollbar-thumb:hover{background:var(--text-muted);}
+@media (max-width:760px){ .history-scroll{ max-height:400px; } }
 .history-item{display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 4px; font-size:13px;}
 .history-item + .history-item{border-top:1px solid var(--border);}
 .history-left{display:flex; flex-direction:column; gap:2px;}
@@ -233,6 +243,10 @@ select:focus, input:focus{outline:2px solid var(--accent); outline-offset:1px;}
 
   <div class="panel" id="leaderboardPanel">
     <h2>Ladder <small>tap a player for matchup history</small></h2>
+    <div class="winner-picker" id="ladderFormatTabs" style="margin-bottom:16px;">
+      <div class="winner-btn selected" data-val="EX12">EX12</div>
+      <div class="winner-btn" data-val="BT26">BT26</div>
+    </div>
     <div id="leaderboard"><div class="loading">Loading ladder…</div></div>
   </div>
 
@@ -271,6 +285,13 @@ select:focus, input:focus{outline:2px solid var(--accent); outline-offset:1px;}
         </div>
       </div>
       <div class="field">
+        <label>Format</label>
+        <div class="winner-picker" id="formatPicker">
+          <div class="winner-btn selected" data-val="EX12">EX12</div>
+          <div class="winner-btn" data-val="BT26">BT26</div>
+        </div>
+      </div>
+      <div class="field">
         <label>Result</label>
         <div class="winner-picker" id="winnerPicker">
           <div class="winner-btn" data-val="p1">Player 1 wins</div>
@@ -286,8 +307,11 @@ select:focus, input:focus{outline:2px solid var(--accent); outline-offset:1px;}
     </div>
 
     <div class="panel">
-      <h2 style="margin-bottom:14px;">Match history</h2>
-      <div id="history"><div class="loading">Loading history…</div></div>
+      <h2 style="margin-bottom:4px;">Match history</h2>
+      <p class="small-note" style="margin:0 0 12px;">Most recent first — scroll for older matches.</p>
+      <div class="history-scroll" id="historyScroll">
+        <div id="history"><div class="loading">Loading history…</div></div>
+      </div>
     </div>
   </div>
 
@@ -333,7 +357,11 @@ const K = 32;
 const AVATAR_PALETTE = ['#F2B705','#3B7DD8','#5FBF7A','#9B6FD1','#E4574A','#4FA65B','#E0B23C','#7A8CB0'];
 
 let state = { meta:{ adminPasscode:null }, players: [], archetypes: [], matches: [] };
+const FORMATS = ['EX12', 'BT26'];
+const DEFAULT_FORMAT = 'EX12';
 let selectedResult = null;
+let selectedFormat = DEFAULT_FORMAT;
+let activeLadderFormat = DEFAULT_FORMAT;
 let isAdmin = false;
 let expandedPlayerId = null;
 
@@ -505,8 +533,37 @@ async function toggleAdmin(){
 }
 
 /* ---------- streaks & matchup stats ---------- */
-function playerStreak(playerId){
-  const pm = state.matches.filter(m=>m.p1Id===playerId || m.p2Id===playerId);
+// Recomputes ELO, W/L/D, and per-match deltas for a single format by replaying
+// that format's matches in order. Nothing about rankings is stored on players —
+// it's always derived fresh from match history, so undo/backfill/edits can never
+// leave stale numbers lying around.
+function computeFormatReplay(format){
+  const standings = new Map(); // playerId -> {elo, wins, losses, draws}
+  const deltas = new Map();    // matchId -> {p1Before, p1After, p2Before, p2After}
+  function ensure(id){
+    if(!standings.has(id)) standings.set(id, { elo: START_ELO, wins:0, losses:0, draws:0 });
+    return standings.get(id);
+  }
+  state.matches
+    .filter(m => (m.format || DEFAULT_FORMAT) === format)
+    .forEach(m=>{
+      const s1 = ensure(m.p1Id), s2 = ensure(m.p2Id);
+      const p1Before = s1.elo, p2Before = s2.elo;
+      const exp1 = expectedScore(p1Before, p2Before);
+      const exp2 = 1 - exp1;
+      let score1, score2;
+      if(m.result === 'p1'){ score1=1; score2=0; s1.wins++; s2.losses++; }
+      else if(m.result === 'p2'){ score1=0; score2=1; s2.wins++; s1.losses++; }
+      else { score1=0.5; score2=0.5; s1.draws++; s2.draws++; }
+      s1.elo = p1Before + K*(score1-exp1);
+      s2.elo = p2Before + K*(score2-exp2);
+      deltas.set(m.id, { p1Before, p1After: s1.elo, p2Before, p2After: s2.elo });
+    });
+  return { standings, deltas };
+}
+
+function playerStreak(playerId, format){
+  const pm = state.matches.filter(m => (m.format || DEFAULT_FORMAT) === format && (m.p1Id===playerId || m.p2Id===playerId));
   if(pm.length===0) return null;
   let streak=0, kind=null;
   for(let i=pm.length-1;i>=0;i--){
@@ -614,11 +671,22 @@ function renderLeaderboard(){
     el.innerHTML = `<div class="empty-note">No players yet — add someone in the "Log a match" panel to start the ladder.</div>`;
     return;
   }
-  const sorted = [...state.players].sort((a,b)=>b.elo-a.elo);
+
+  const { standings } = computeFormatReplay(activeLadderFormat);
+  const participants = state.players
+    .filter(p => standings.has(p.id))
+    .map(p => ({ ...p, ...standings.get(p.id) }));
+
+  if(participants.length===0){
+    el.innerHTML = `<div class="empty-note">No ${escapeHtml(activeLadderFormat)} matches logged yet — log one to start this ladder.</div>`;
+    return;
+  }
+
+  const sorted = participants.sort((a,b)=>b.elo-a.elo);
   el.innerHTML = sorted.map((p,i)=>{
     const tier = getTier(p.elo);
     const dots = [1,2,3,4].map(n=>`<span class="tier-dot ${n<=tier.level?'on':''}"></span>`).join('');
-    const streak = playerStreak(p.id);
+    const streak = playerStreak(p.id, activeLadderFormat);
     const streakText = streak ? ` · ${streak.kind==='win'?'W':'L'}${streak.streak}` : '';
     const open = expandedPlayerId===p.id;
     let detailHtml = '';
@@ -676,6 +744,15 @@ function renderHistory(){
     el.innerHTML = `<div class="empty-note">No matches recorded yet.</div>`;
     return;
   }
+
+  // Deltas are format-specific (each format has its own independent ELO track),
+  // so replay every format and merge the per-match deltas for display here.
+  const deltas = new Map();
+  FORMATS.forEach(fmt=>{
+    const { deltas: fmtDeltas } = computeFormatReplay(fmt);
+    fmtDeltas.forEach((v,k)=> deltas.set(k, v));
+  });
+
   const items = [...state.matches].slice().reverse();
   el.innerHTML = items.map(m=>{
     const p1 = state.players.find(p=>p.id===m.p1Id);
@@ -692,14 +769,16 @@ function renderHistory(){
       const loseArch = m.result==='p1' ? m.p2ArchId : m.p1ArchId;
       resultLine = `${escapeHtml(winnerName)} (${archBadge(winArch)}) defeated ${escapeHtml(loserName)} (${archBadge(loseArch)})`;
     }
-    const d1 = Math.round(m.p1EloAfter - m.p1EloBefore);
+    const d = deltas.get(m.id);
+    const d1 = d ? Math.round(d.p1After - d.p1Before) : 0;
     const date = new Date(m.timestamp);
     const dateStr = date.toLocaleDateString(undefined,{month:'short', day:'numeric'}) + ' ' + date.toLocaleTimeString(undefined,{hour:'numeric', minute:'2-digit'});
+    const formatStr = escapeHtml(m.format || DEFAULT_FORMAT);
     return `
       <div class="history-item">
         <div class="history-left">
           <div class="history-result">${resultLine}</div>
-          <div class="history-time">${dateStr}</div>
+          <div class="history-time">${formatStr} · ${dateStr}</div>
         </div>
         <div class="delta ${d1>=0?'pos':'neg'}">${d1>=0?'+':''}${d1}</div>
       </div>`;
@@ -712,6 +791,8 @@ function renderAdminUI(){
 
   const container = document.getElementById('adminPanels');
   if(!isAdmin){ container.innerHTML=''; return; }
+
+  const legacyFormatCount = state.matches.filter(m=>!m.format).length;
 
   const archRows = state.archetypes.length ? state.archetypes.map(a=>`
     <div class="manage-row" data-arch-id="${a.id}">
@@ -749,6 +830,13 @@ function renderAdminUI(){
       </div>
       <p class="small-note">Undo/reset and art management are only visible to admins, to prevent accidental data loss. Note this passcode system is a lightweight safeguard against misclicks, not strong security — the app has no real backend.</p>
     </div>
+    <div class="panel admin-panel">
+      <h2>Data maintenance <small>admin only</small></h2>
+      <div class="footer-row">
+        <span class="small-note" style="margin-top:0;">${legacyFormatCount} match(es) have no format set</span>
+        <button class="btn-ghost btn-small" id="backfillFormatBtn" ${legacyFormatCount===0 ? 'disabled' : ''}>Backfill missing formats to EX12</button>
+      </div>
+    </div>
   `;
 
   container.querySelectorAll('.save-arch-btn').forEach(btn=>{
@@ -781,6 +869,7 @@ function renderAdminUI(){
   });
   document.getElementById('undoBtn').addEventListener('click', undoLast);
   document.getElementById('resetBtn').addEventListener('click', resetAll);
+  document.getElementById('backfillFormatBtn').addEventListener('click', backfillMatchFormats);
 }
 
 function renderAll(){
@@ -802,7 +891,7 @@ async function addPlayer(){
     showFormError('A player with that name already exists.');
     return;
   }
-  state.players.push({ id: uid(), name, elo: START_ELO, wins:0, losses:0, draws:0, avatarUrl:null });
+  state.players.push({ id: uid(), name, avatarUrl: null });
   input.value='';
   renderAll();
   await saveData();
@@ -810,7 +899,12 @@ async function addPlayer(){
 
 function setWinnerSelection(val){
   selectedResult = val;
-  document.querySelectorAll('.winner-btn').forEach(b=> b.classList.toggle('selected', b.dataset.val===val));
+  document.querySelectorAll('#winnerPicker .winner-btn').forEach(b=> b.classList.toggle('selected', b.dataset.val===val));
+}
+
+function setFormatSelection(val){
+  selectedFormat = val;
+  document.querySelectorAll('#formatPicker .winner-btn').forEach(b=> b.classList.toggle('selected', b.dataset.val===val));
 }
 
 function resolveArchFromForm(prefix){
@@ -835,28 +929,15 @@ async function submitMatch(){
   if(!p1ArchId || !p2ArchId){ showFormError('Choose or enter an archetype for both players.'); return; }
   if(!selectedResult){ showFormError('Pick a result.'); return; }
 
-  const p1 = state.players.find(p=>p.id===p1Id);
-  const p2 = state.players.find(p=>p.id===p2Id);
-
-  const p1EloBefore = p1.elo, p2EloBefore = p2.elo;
-  const exp1 = expectedScore(p1EloBefore, p2EloBefore);
-  const exp2 = 1 - exp1;
-  let score1, score2;
-  if(selectedResult==='p1'){ score1=1; score2=0; p1.wins++; p2.losses++; }
-  else if(selectedResult==='p2'){ score1=0; score2=1; p2.wins++; p1.losses++; }
-  else { score1=0.5; score2=0.5; p1.draws++; p2.draws++; }
-
-  p1.elo = p1EloBefore + K*(score1-exp1);
-  p2.elo = p2EloBefore + K*(score2-exp2);
-
+  // No ELO math here — a match is just a fact ("these two played, this happened").
+  // Ratings for whichever format this belongs to get recalculated from the full
+  // match history whenever the leaderboard renders.
   state.matches.push({
     id: uid(), timestamp: Date.now(),
-    p1Id, p2Id, p1ArchId, p2ArchId, result: selectedResult,
-    p1EloBefore, p1EloAfter: p1.elo, p2EloBefore, p2EloAfter: p2.elo
+    p1Id, p2Id, p1ArchId, p2ArchId, result: selectedResult, format: selectedFormat
   });
 
   setWinnerSelection(null);
-  document.querySelectorAll('.winner-btn').forEach(b=>b.classList.remove('selected'));
   document.getElementById('p1ArchNew').value=''; document.getElementById('p2ArchNew').value='';
   renderAll();
   await saveData();
@@ -879,20 +960,16 @@ function repeatLastMatchup(){
   document.getElementById('p1ArchNew').value='';
   document.getElementById('p2ArchNew').value='';
 
+  setFormatSelection(last.format || DEFAULT_FORMAT);
   setWinnerSelection(null);
-  document.querySelectorAll('.winner-btn').forEach(b=>b.classList.remove('selected'));
 }
 
 
 async function undoLast(){
   if(state.matches.length===0) return;
-  const ok = await customConfirm('Undo the most recent match? This will restore both players\' previous ELO.');
+  const ok = await customConfirm('Undo the most recent match? Rankings will be recalculated automatically.');
   if(!ok) return;
-  const m = state.matches.pop();
-  const p1 = state.players.find(p=>p.id===m.p1Id);
-  const p2 = state.players.find(p=>p.id===m.p2Id);
-  if(p1){ p1.elo = m.p1EloBefore; if(m.result==='p1') p1.wins--; else if(m.result==='p2') p1.losses--; else p1.draws--; }
-  if(p2){ p2.elo = m.p2EloBefore; if(m.result==='p2') p2.wins--; else if(m.result==='p1') p2.losses--; else p2.draws--; }
+  state.matches.pop(); // ratings are derived, so nothing else needs to be reversed manually
   renderAll();
   await saveData();
 }
@@ -904,6 +981,23 @@ async function resetAll(){
   state = { meta:{ adminPasscode: keepPasscode }, players: [], archetypes: [], matches: [] };
   renderAll();
   await saveData();
+}
+
+// One-time (or run-again-safely) migration: any match recorded before the format
+// field existed gets treated as EX12 for display already, but this actually writes
+// format: 'EX12' onto those records so they're consistent in the stored data too.
+async function backfillMatchFormats(){
+  const missing = state.matches.filter(m=>!m.format);
+  if(missing.length === 0){
+    await customAlert('No legacy matches need backfilling — every match already has a format set.');
+    return;
+  }
+  const ok = await customConfirm(`Set format to EX12 on ${missing.length} existing match(es) that don't have one yet?\n\nThis updates the shared live data everyone sees.`);
+  if(!ok) return;
+  missing.forEach(m=> m.format = DEFAULT_FORMAT);
+  renderAll();
+  await saveData();
+  await customAlert(`Done — ${missing.length} match(es) updated to EX12.`);
 }
 
 // Test-mode only: fills the sandbox document with fake players, archetypes, and a
@@ -919,12 +1013,12 @@ async function seedDummyData(){
 
   state = {
     meta: { adminPasscode: keepPasscode },
-    players: names.map(n=>({ id: uid(), name: n, elo: START_ELO, wins:0, losses:0, draws:0, avatarUrl:null })),
+    players: names.map(n=>({ id: uid(), name: n, avatarUrl: null })),
     archetypes: archNames.map(n=>({ id: uid(), name: n, artUrl: null })),
     matches: []
   };
 
-  const numMatches = 14;
+  const numMatches = 24;
   for(let i=0;i<numMatches;i++){
     const p1 = state.players[Math.floor(Math.random()*state.players.length)];
     let p2;
@@ -934,22 +1028,16 @@ async function seedDummyData(){
 
     const roll = Math.random();
     const result = roll < 0.1 ? 'draw' : (roll < 0.55 ? 'p1' : 'p2');
+    // leave ~15% without a format so there's something to test the backfill button on;
+    // the rest split across both formats so both ladder tabs have real data to show
+    const format = Math.random() < 0.15 ? undefined : FORMATS[Math.floor(Math.random()*FORMATS.length)];
 
-    const p1EloBefore = p1.elo, p2EloBefore = p2.elo;
-    const exp1 = expectedScore(p1EloBefore, p2EloBefore);
-    const exp2 = 1 - exp1;
-    let score1, score2;
-    if(result === 'p1'){ score1=1; score2=0; p1.wins++; p2.losses++; }
-    else if(result === 'p2'){ score1=0; score2=1; p2.wins++; p1.losses++; }
-    else { score1=0.5; score2=0.5; p1.draws++; p2.draws++; }
-    p1.elo = p1EloBefore + K*(score1-exp1);
-    p2.elo = p2EloBefore + K*(score2-exp2);
-
-    state.matches.push({
+    const matchRecord = {
       id: uid(), timestamp: Date.now() - (numMatches-i)*3600000,
-      p1Id: p1.id, p2Id: p2.id, p1ArchId: arch1.id, p2ArchId: arch2.id, result,
-      p1EloBefore, p1EloAfter: p1.elo, p2EloBefore, p2EloAfter: p2.elo
-    });
+      p1Id: p1.id, p2Id: p2.id, p1ArchId: arch1.id, p2ArchId: arch2.id, result
+    };
+    if(format) matchRecord.format = format;
+    state.matches.push(matchRecord);
   }
 
   renderAll();
@@ -988,7 +1076,14 @@ function init(){
   document.getElementById('p1Arch').addEventListener('change', ()=> toggleArchNewInput('p1Arch'));
   document.getElementById('p2Arch').addEventListener('change', ()=> toggleArchNewInput('p2Arch'));
 
-  document.querySelectorAll('.winner-btn').forEach(b=> b.addEventListener('click', ()=> setWinnerSelection(b.dataset.val)));
+  document.querySelectorAll('#winnerPicker .winner-btn').forEach(b=> b.addEventListener('click', ()=> setWinnerSelection(b.dataset.val)));
+  document.querySelectorAll('#formatPicker .winner-btn').forEach(b=> b.addEventListener('click', ()=> setFormatSelection(b.dataset.val)));
+  document.querySelectorAll('#ladderFormatTabs .winner-btn').forEach(b=> b.addEventListener('click', ()=>{
+    activeLadderFormat = b.dataset.val;
+    document.querySelectorAll('#ladderFormatTabs .winner-btn').forEach(x=> x.classList.toggle('selected', x===b));
+    expandedPlayerId = null;
+    renderLeaderboard();
+  }));
   startListening();
 }
 init();
